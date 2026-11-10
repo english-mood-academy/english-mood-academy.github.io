@@ -1,7 +1,7 @@
-# Custom Pages deploy with a longer sync timeout.
-# The official branch-based pages-build-deployment uses a 10-minute
-# deploy-pages timeout and has been aborting while syncing ~500MB of
-# dictionary HTML (embedded audio). Do not delete live student pages.
+# Custom Pages deploy that waits longer than actions/deploy-pages allows.
+# That action hard-caps timeout at 10 minutes and then CANCELS the deployment.
+# Today's ~500MB site (embedded dictionary audio) is taking longer than 10 minutes
+# to sync, so we create the same Pages deployment and poll without cancelling.
 name: Deploy GitHub Pages
 
 on:
@@ -13,6 +13,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read
 
 concurrency:
   group: pages-custom
@@ -40,11 +41,72 @@ jobs:
     timeout-minutes: 35
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: https://english-mood-academy.github.io/
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
-        with:
-          timeout: 1800000
-          reporting_interval: 10000
-          error_count: 20
+      - name: Deploy to GitHub Pages and wait (no 10-minute cancel)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.name=="github-pages") | .id' | head -1)
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No github-pages artifact found for this run"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts"
+            exit 1
+          fi
+          echo "Artifact ID: $ARTIFACT_ID"
+
+          ID_TOKEN=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            -H "Accept: application/json" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -r '.value')
+          if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
+            echo "Failed to get OIDC token"
+            exit 1
+          fi
+
+          PAYLOAD=$(jq -n --argjson artifact_id "$ARTIFACT_ID" --arg sha "$GITHUB_SHA" --arg oidc "$ID_TOKEN" \
+            '{artifact_id:$artifact_id, pages_build_version:$sha, oidc_token:$oidc}')
+          echo "Creating Pages deployment for $GITHUB_SHA ..."
+          RESP=$(curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages/deployments" \
+            -d "$PAYLOAD")
+          echo "$RESP" | jq '{id, status_url, page_url, preview_url} // .'
+          DEPLOY_ID=$(echo "$RESP" | jq -r '.id // .status_url? // empty')
+          if [ -z "$DEPLOY_ID" ] || [ "$DEPLOY_ID" = "null" ]; then
+            # id may be the SHA
+            DEPLOY_ID="$GITHUB_SHA"
+          fi
+          # status_url may end with the id
+          if echo "$DEPLOY_ID" | grep -q '/'; then
+            DEPLOY_ID=$(basename "$DEPLOY_ID")
+          fi
+          echo "Deployment ID: $DEPLOY_ID"
+
+          # Poll up to 25 minutes. Do NOT cancel on timeout — let Pages keep syncing.
+          DEADLINE=$((SECONDS+1500))
+          while [ $SECONDS -lt $DEADLINE ]; do
+            STATUS_JSON=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages/deployments/${DEPLOY_ID}" || true)
+            STATUS=$(echo "$STATUS_JSON" | jq -r '.status // "unknown"')
+            echo "$(date -u +%H:%M:%S) status=$STATUS"
+            case "$STATUS" in
+              succeed)
+                echo "Reported success!"
+                exit 0
+                ;;
+              deployment_failed|deployment_perms_error|deployment_content_failed|deployment_cancelled|deployment_lost)
+                echo "Permanent failure: $STATUS"
+                echo "$STATUS_JSON"
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo "Still syncing after 25 minutes; leaving the deployment running (not cancelling)."
+          exit 1
